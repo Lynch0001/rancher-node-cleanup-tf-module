@@ -1,5 +1,7 @@
 namespace: kube-system
 
+replicas: 2
+
 image:
   repository: "rancher-node-cleaner"
   tag: "latest"
@@ -8,16 +10,14 @@ image:
 
 config:
   dryRun: true
-  verbose: true
+  pollingSeconds: 30
+  graceSeconds: 180
   rancher:
     url: "https://rancher.example.com"
     token: ""
     clusterId: "c-m-abcde"
     awsRegion: "us-east-1"
     insecureSkipTlsVerify: true
-
-cron:
-  schedule: "*/30 * * * *"
 
 resources:
   requests:

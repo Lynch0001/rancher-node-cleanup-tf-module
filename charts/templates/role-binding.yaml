@@ -1,12 +1,12 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: rancher-node-cleaner
+  name: cleaner-rb
   namespace: {{ .Values.namespace }}
 subjects:
   - kind: ServiceAccount
-    name: rancher-node-cleaner
+    name: cleaner-sa
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: rancher-node-cleaner
+  name: cleaner-role
