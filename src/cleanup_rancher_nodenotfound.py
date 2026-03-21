@@ -620,20 +620,165 @@ def strings_blob(node: Dict[str, Any]) -> str:
     return " | ".join(s.lower() for s in flatten_strings(interesting))
 
 
+def collect_string_values(value: Any, prefix: str = "") -> Iterable[Tuple[str, str]]:
+    if value is None:
+        return
+    if isinstance(value, (str, bool, int, float)):
+        if prefix:
+            yield prefix, str(value)
+        return
+    if isinstance(value, dict):
+        for k, v in value.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            yield from collect_string_values(v, key)
+        return
+    if isinstance(value, list):
+        for idx, item in enumerate(value):
+            key = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+            yield from collect_string_values(item, key)
+
+
+def select_decision_metadata(node: Dict[str, Any]) -> Dict[str, Any]:
+    labels = node.get("labels") or {}
+    annotations = node.get("annotations") or {}
+    node_spec = node.get("nodeSpec") or node.get("node_spec") or {}
+    conditions = node.get("conditions") or []
+
+    exact_label_keys = [
+        "cattle.io/instance-id",
+        "node.kubernetes.io/instance-id",
+        "karpenter.k8s.aws/instance-id",
+        "node.kubernetes.io/instance-type",
+        "beta.kubernetes.io/instance-type",
+        "topology.kubernetes.io/region",
+        "topology.kubernetes.io/zone",
+        "failure-domain.beta.kubernetes.io/region",
+        "failure-domain.beta.kubernetes.io/zone",
+        "eks.amazonaws.com/nodegroup",
+        "eks.amazonaws.com/capacityType",
+        "karpenter.sh/nodepool",
+        "karpenter.sh/provisioner-name",
+        "karpenter.sh/capacity-type",
+        "karpenter.k8s.aws/ec2nodeclass",
+        "karpenter.k8s.aws/instance-category",
+        "karpenter.k8s.aws/instance-family",
+        "karpenter.k8s.aws/instance-generation",
+        "karpenter.k8s.aws/instance-size",
+        "karpenter.k8s.aws/capacity-type",
+    ]
+    exact_annotation_keys = [
+        "rke.cattle.io/external-id",
+        "cattle.io/external-id",
+        "cluster.x-k8s.io/provider-id",
+        "cluster.x-k8s.io/cluster-name",
+        "karpenter.sh/nodeclaim",
+        "karpenter.k8s.aws/ec2nodeclass",
+    ]
+    fuzzy_tokens = (
+        "autoscaling", "nodegroup", "launch-template", "launchtemplate",
+        "karpenter", "nodepool", "provisioner", "nodeclaim",
+        "instance-id", "instance-type", "capacity-type", "zone", "region",
+    )
+
+    selected_labels = {k: labels[k] for k in exact_label_keys if k in labels}
+    selected_annotations = {k: annotations[k] for k in exact_annotation_keys if k in annotations}
+
+    for k, v in labels.items():
+        if k not in selected_labels and any(tok in k.lower() for tok in fuzzy_tokens):
+            selected_labels[k] = v
+    for k, v in annotations.items():
+        if k not in selected_annotations and any(tok in k.lower() for tok in fuzzy_tokens):
+            selected_annotations[k] = v
+
+    condition_bits: Dict[str, Any] = {}
+    if isinstance(conditions, list):
+        for cond in conditions:
+            if not isinstance(cond, dict):
+                continue
+            cond_type = str(cond.get("type") or cond.get("name") or "").strip()
+            status = str(cond.get("status") or cond.get("state") or cond.get("value") or "").strip()
+            if cond_type and (cond_type.lower() in {"cordoned", "unschedulable", "ready"} or status.lower() in {"true", "false", "unknown"}):
+                condition_bits[cond_type] = status
+
+    provider_candidates = []
+    for keyspace in (node, node_spec, annotations, labels):
+        if isinstance(keyspace, dict):
+            for k, v in keyspace.items():
+                if k in {"providerID", "providerId", "provider_id"} and isinstance(v, str) and v:
+                    provider_candidates.append(v)
+    if isinstance(node_spec, dict):
+        for k in ("providerID", "providerId", "provider_id", "unschedulable"):
+            if k in node_spec:
+                provider_candidates.append(node_spec[k])
+
+    return {
+        "name": node.get("name") or node.get("hostname") or node.get("id"),
+        "provider_candidates": provider_candidates,
+        "labels": selected_labels,
+        "annotations": selected_annotations,
+        "node_spec": {
+            k: node_spec.get(k)
+            for k in ("providerID", "providerId", "provider_id", "unschedulable")
+            if isinstance(node_spec, dict) and k in node_spec
+        },
+        "conditions": condition_bits,
+    }
+
+
+def debug_log_node_evaluation(
+    cluster_id: str,
+    node_id: str,
+    node: Dict[str, Any],
+    decision: NodeDecision,
+    record: Optional[Dict[str, Any]],
+    should_delete_flag: bool,
+    decision_path: str,
+) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+
+    logger.debug(
+        json.dumps(
+            {
+                "event": "node_evaluation_debug",
+                "cluster_id": cluster_id,
+                "node_id": node_id,
+                "node_name": decision.node_name,
+                "instance_id": decision.instance_id,
+                "karpenter": decision.is_karpenter,
+                "rancher_state": decision.rancher_state,
+                "rancher_reasons": decision.rancher_reasons,
+                "aws_state": decision.aws_state,
+                "aws_missing": decision.aws_missing,
+                "aws_missing_count": int((record or {}).get("aws_missing_count") or 0),
+                "aws_missing_since": (record or {}).get("aws_missing_since"),
+                "bad_since": (record or {}).get("bad_since"),
+                "delete_attempts": int((record or {}).get("delete_attempts") or 0),
+                "quarantined": bool((record or {}).get("quarantined") or False),
+                "should_delete": should_delete_flag,
+                "decision_path": decision_path,
+                "decision_metadata": select_decision_metadata(node),
+            },
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
 def extract_instance_id(node: Dict[str, Any]) -> Optional[str]:
-    candidates: List[str] = []
+    prioritized_candidates: List[str] = []
+
+    def add_candidate(value: Any) -> None:
+        if isinstance(value, str) and value:
+            prioritized_candidates.append(value)
 
     for k in ("providerId", "providerID", "provider_id"):
-        v = node.get(k)
-        if isinstance(v, str) and v:
-            candidates.append(v)
+        add_candidate(node.get(k))
 
     node_spec = node.get("nodeSpec") or node.get("node_spec") or {}
     if isinstance(node_spec, dict):
         for k in ("providerID", "providerId", "provider_id"):
-            v = node_spec.get(k)
-            if isinstance(v, str) and v:
-                candidates.append(v)
+            add_candidate(node_spec.get(k))
 
     labels = node.get("labels") or {}
     if isinstance(labels, dict):
@@ -642,9 +787,7 @@ def extract_instance_id(node: Dict[str, Any]) -> Optional[str]:
             "node.kubernetes.io/instance-id",
             "karpenter.k8s.aws/instance-id",
         ):
-            v = labels.get(lk)
-            if isinstance(v, str) and v:
-                candidates.append(v)
+            add_candidate(labels.get(lk))
 
     annotations = node.get("annotations") or {}
     if isinstance(annotations, dict):
@@ -653,13 +796,22 @@ def extract_instance_id(node: Dict[str, Any]) -> Optional[str]:
             "cattle.io/external-id",
             "cluster.x-k8s.io/provider-id",
         ):
-            v = annotations.get(ak)
-            if isinstance(v, str) and v:
-                candidates.append(v)
+            add_candidate(annotations.get(ak))
 
-    blob = " | ".join(candidates)
-    match = INSTANCE_ID_RE.search(blob)
-    return match.group(1) if match else None
+    for _, value in collect_string_values({
+        "node": node,
+        "nodeSpec": node_spec,
+        "labels": labels,
+        "annotations": annotations,
+    }):
+        if "i-" in value:
+            prioritized_candidates.append(value)
+
+    for candidate in prioritized_candidates:
+        match = INSTANCE_ID_RE.search(candidate)
+        if match:
+            return match.group(1)
+    return None
 
 
 def is_karpenter_node(node: Dict[str, Any]) -> bool:
@@ -1363,29 +1515,23 @@ def main() -> int:
                         if decision.aws_missing:
                             metrics.aws_missing_total.labels(cluster_id).inc()
 
-                        if not decision.instance_id:
+                        should_track = bool(decision.instance_id) and (decision.aws_missing or bool(decision.rancher_reasons))
+                        record: Optional[Dict[str, Any]] = None
+
+                        if should_track:
+                            record = update_tracker_record(state, decision, now_ts)
+                            state_changed = True
+                            metrics.candidates_total.labels(cluster_id, str(decision.is_karpenter).lower()).inc()
+                            delete_ok, delete_path = should_delete(decision, record, runtime_cfg, now_ts)
+                        else:
                             if decision.key in state:
                                 del state[decision.key]
                                 state_changed = True
-                            log_event(
-                                "node_skipped_no_instance_id",
-                                cluster_id=cluster_id,
-                                node_id=node_id,
-                                node_name=decision.node_name,
-                            )
-                            continue
+                            if not decision.instance_id:
+                                delete_ok, delete_path = False, "no-instance-id"
+                            else:
+                                delete_ok, delete_path = False, "healthy"
 
-                        if not decision.aws_missing and not decision.rancher_reasons:
-                            if decision.key in state:
-                                del state[decision.key]
-                                state_changed = True
-                            continue
-
-                        record = update_tracker_record(state, decision, now_ts)
-                        state_changed = True
-                        metrics.candidates_total.labels(cluster_id, str(decision.is_karpenter).lower()).inc()
-
-                        delete_ok, delete_path = should_delete(decision, record, runtime_cfg, now_ts)
                         metrics.decisions_total.labels("delete" if delete_ok else "keep", delete_path).inc()
 
                         log_event(
@@ -1399,8 +1545,17 @@ def main() -> int:
                             rancher_reasons=decision.rancher_reasons,
                             aws_state=decision.aws_state,
                             aws_missing=decision.aws_missing,
-                            aws_missing_count=record.get("aws_missing_count", 0),
+                            aws_missing_count=(record or {}).get("aws_missing_count", 0),
                             delete=delete_ok,
+                            decision_path=delete_path,
+                        )
+                        debug_log_node_evaluation(
+                            cluster_id=cluster_id,
+                            node_id=node_id,
+                            node=node,
+                            decision=decision,
+                            record=record,
+                            should_delete_flag=delete_ok,
                             decision_path=delete_path,
                         )
 
