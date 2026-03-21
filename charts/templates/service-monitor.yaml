@@ -1,0 +1,18 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: basic-app-monitor
+  labels:
+    app: rancher-node-cleaner
+  namespace: {{ .Values.namespace }}
+spec:
+  selector:
+    matchLabels:
+      app: rancher-node-cleaner
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.namespace }}
+  endpoints:
+  - port: http-app
+    interval: 30s
+    path: /metrics

@@ -22,6 +22,9 @@ spec:
         - name: cleaner
           image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+          - containerPort: 8080
+            name: http-app
           envFrom:
             - secretRef:
                 name: rancher-api
@@ -44,7 +47,7 @@ spec:
             {{- toYaml .Values.resources | nindent 8 }}
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: 8080
             initialDelaySeconds: 3
             periodSeconds: 10

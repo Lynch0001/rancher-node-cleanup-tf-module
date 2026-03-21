@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: cleaner-config
-  namespace: rancher-node-cleaner
+  namespace: {{ .Values.namespace }}
 data:
   CLUSTER_IDS: {{ .Values.config.rancher.clusterId | quote }}
   POLL_SECONDS: {{ .Values.config.pollingSeconds | quote }}
